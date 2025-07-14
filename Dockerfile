@@ -35,4 +35,4 @@ COPY . .
 
 # 5. Define the command to run your application
 # Render provides the $PORT environment variable, which Gunicorn will use.
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:10000"]
+CMD gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind "0.0.0.0:$PORT"

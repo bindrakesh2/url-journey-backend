@@ -4,4 +4,4 @@ uvicorn[standard]
 playwright
 validators
 ipaddress
-httpx
+httpx[http2]

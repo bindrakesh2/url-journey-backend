@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     async with async_playwright() as p:
         browser = None
         try:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
             app.state.browser = browser
             logger.info("Browser launched successfully and is ready for requests.")
             yield
@@ -107,9 +107,11 @@ def get_server_name(headers: dict, url: str) -> str:
     if is_akamai: return "Akamai"
     return "Unknown"
 
-# --- Core Analysis Logic (Your original function, unchanged) ---
+# --- Core Analysis Logic ---
 async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSocket):
     context = None
+    
+    # --- THIS IS THE MODIFIED ERROR HANDLING BLOCK ---
     try:
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -146,17 +148,39 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         result = {"originalURL": url, "finalURL": final_url, "redirectChain": redirect_chain, "totalTime": time.time() - start_time}
         await websocket.send_text(json.dumps(result))
 
-    except (PlaywrightTimeoutError, PlaywrightError) as e:
-        error_comment = "An error occurred during navigation"
-        if isinstance(e, PlaywrightTimeoutError):
-            error_comment = "Navigation timed out after 60s"
-        elif "net::ERR_NAME_NOT_RESOLVED" in str(e):
+    except TooManyRedirectsError:
+        error_comment = "Browser detected too many redirects"
+        logger.warning(f"Too many redirects for {url}")
+        result = {"originalURL": url, "error": error_comment}
+        await websocket.send_text(json.dumps(result))
+        
+    except PlaywrightTimeoutError:
+        error_comment = "Navigation timed out after 60s"
+        logger.warning(f"Timeout error for {url}")
+        result = {"originalURL": url, "error": error_comment}
+        await websocket.send_text(json.dumps(result))
+
+    except PlaywrightError as e:
+        # Catch specific navigation errors like DNS failures
+        error_str = str(e)
+        if "ERR_NAME_NOT_RESOLVED" in error_str:
             error_comment = "Navigation failed: DNS resolution error"
         else:
             error_comment = "Navigation failed: Could not load page"
-        
-        logger.warning(f"Error for {url}: {error_comment}")
+        logger.warning(f"Playwright navigation error for {url}: {error_comment}")
         result = {"originalURL": url, "error": error_comment}
+        await websocket.send_text(json.dumps(result))
+
+    except asyncio.CancelledError:
+        logger.info(f"Task for {url} was cancelled because client disconnected.")
+        # Do not send a message as the client is gone
+
+    except Exception as e:
+        # Generic catch-all for any other unexpected errors
+        error_comment = "A critical server error occurred"
+        logger.error(f"Critical error fetching {url}: {e}", exc_info=True)
+        result = {"originalURL": url, "error": error_comment}
+        # Check if client is still connected before sending
         if websocket.client_state.name == 'CONNECTED':
             await websocket.send_text(json.dumps(result))
             
@@ -164,7 +188,8 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         if context:
             await context.close()
 
-# --- WebSocket Handler (with the minimal change for resilience) ---
+
+# --- The rest of the file is unchanged ---
 async def validate_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
@@ -178,21 +203,9 @@ async def analyze_urls_websocket(websocket: WebSocket):
     browser = websocket.app.state.browser
     semaphore = asyncio.Semaphore(5)
 
-    # --- THIS IS THE ONLY MODIFIED SECTION ---
     async def limited_fetch(url):
-        """ This wrapper function adds the resilience you need. """
-        try:
-            # It tries to run the main analysis function
-            async with semaphore:
-                await fetch_url_with_playwright(browser, url, websocket)
-        except Exception as e:
-            # If a critical, unexpected error happens, it's caught here
-            logger.error(f"A critical error in the fetch task for {url} was caught: {e}", exc_info=True)
-            # An error message is sent for the specific URL that failed
-            error_result = {"originalURL": url, "error": "A critical processing error occurred"}
-            if websocket.client_state.name == 'CONNECTED':
-                await websocket.send_json(error_result)
-            # The rest of the tasks in asyncio.gather will continue unaffected
+        async with semaphore:
+            await fetch_url_with_playwright(browser, url, websocket)
 
     active_tasks = []
     try:

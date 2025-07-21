@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import httpx
 import uvicorn
@@ -6,7 +5,8 @@ import logging
 import socket
 import ipaddress
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+# Make sure to import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import urlparse
 
 # --- Configuration ---
@@ -15,6 +15,22 @@ logger = logging.getLogger(__name__)
 
 # --- FastAPI App Initialization ---
 app = FastAPI()
+
+# --- FIX #1: Add CORS Middleware ---
+# List of domains that are allowed to connect to your backend.
+origins = [
+    "http://localhost:3000",          # For your local React development
+    "https://urljourney.netlify.app", # Your deployed React frontend
+    # Add any other frontend URLs you use
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods
+    allow_headers=["*"], # Allows all headers
+)
 
 # --- Server Name Detection Logic (omitted for brevity, no changes here) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
@@ -60,100 +76,99 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     if is_akamai: return "Akamai"
     return "Unknown"
 
-async def check_url_status(client: httpx.AsyncClient, url: str, index: int):
+async def check_url_status(client: httpx.AsyncClient, url: str):
+    # This function is simplified to match the React frontend's expected data structure
+    start_time = time.time()
     redirect_chain = []
     current_url = url
-    final_server_name = "N/A"
     MAX_REDIRECTS = 15
 
-    # Base response structure now includes the original index
-    response_data = {"index": index, "url": url, "status": "", "comment": "", "serverName": "N/A", "redirectChain": []}
-
     try:
-        for i in range(MAX_REDIRECTS):
+        for _ in range(MAX_REDIRECTS):
             response = await client.get(current_url, follow_redirects=False, timeout=20.0)
             server_name = await get_server_name_advanced(response.headers, str(response.url))
             
-            if i == 0:
-                final_server_name = server_name
-
+            hop_info = {
+                "url": str(response.url), 
+                "status": response.status_code, 
+                "server": server_name,
+                "timestamp": time.time() - start_time
+            }
+            redirect_chain.append(hop_info)
+            
             if response.is_redirect:
                 target_url = response.headers.get('location')
-                if target_url and target_url.startswith('/'):
-                    base_url = urlparse(current_url)
-                    target_url = f"{base_url.scheme}://{base_url.netloc}{target_url}"
-
-                hop_info = {"status": response.status_code, "url": target_url or 'N/A'}
-                redirect_chain.append(hop_info)
-                
                 if not target_url:
-                    response_data.update(status=response.status_code, comment="Redirect missing location")
-                    break
+                    raise Exception("Redirect missing location header")
+                
+                # Handle relative redirects
+                if target_url.startswith('/'):
+                    base = urlparse(current_url)
+                    target_url = f"{base.scheme}://{base.netloc}{target_url}"
                 current_url = target_url
             else:
                 response.raise_for_status()
-                if redirect_chain:
-                    redirect_chain.append({"status": response.status_code, "url": str(response.url)})
-                
-                response_data.update(status=(redirect_chain[0]['status'] if redirect_chain else response.status_code), comment=("Redirect Chain" if redirect_chain else "OK"))
-                break
+                break # Exit loop on a non-redirect
         else:
-            response_data.update(status="Error", comment="Too many redirects")
+            raise Exception("Too many redirects")
 
-    except httpx.HTTPStatusError as e:
-        response_data.update(status=e.response.status_code, comment="Not Found" if e.response.status_code == 404 else "Client/Server Error")
-    except httpx.RequestError:
-        response_data.update(status="Error", comment="Request failed (e.g., DNS error)")
-    except Exception:
-        response_data.update(status="Error", comment="An unexpected error occurred")
+        return {
+            "originalURL": url, 
+            "finalURL": current_url,
+            "redirectChain": redirect_chain,
+            "totalTime": time.time() - start_time
+        }
 
-    response_data["serverName"] = final_server_name
-    response_data["redirectChain"] = redirect_chain
-    return response_data
+    except Exception as e:
+        error_message = "An error occurred"
+        if isinstance(e, httpx.HTTPStatusError):
+            error_message = f"HTTP Error: {e.response.status_code}"
+        elif isinstance(e, httpx.RequestError):
+            error_message = "Request failed (e.g., DNS or network error)"
+        else:
+            error_message = str(e)
 
-@app.websocket("/ws")
+        return {
+            "originalURL": url,
+            "error": error_message
+        }
+
+
+@app.websocket("/analyze")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
-        data = await websocket.receive_text()
+        # The React code sends a JSON object with a 'urls' key
+        data = await websocket.receive_json()
+        urls = data.get("urls", [])
         
-        # --- FIX FOR PRESERVING ORDER ---
-        # Get raw URLs, then create an ordered list of unique URLs
-        raw_urls = [url.strip() for url in data.splitlines() if url.strip()]
-        urls_in_order = list(dict.fromkeys(raw_urls))
-        
-        CONCURRENCY_LIMIT = 100
+        CONCURRENCY_LIMIT = 50 # Reduced for stability
         semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-        async def bound_check(url, index, client):
+        async def bound_check(url, client):
             async with semaphore:
-                return await check_url_status(client, url, index)
+                return await check_url_status(client, url)
 
-        async with httpx.AsyncClient(http2=True) as client:
+        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=100)) as client:
             tasks = []
-            # Use enumerate to pass the original index
-            for index, url in enumerate(urls_in_order):
+            for url in urls:
+                # The React frontend doesn't need "processing" messages, so we remove them
                 if not url.startswith(("http://", "https://")): url = f"https://{url}"
-                try:
-                    parsed_url = urlparse(url)
-                    if not (parsed_url.scheme and parsed_url.netloc): raise ValueError
-                except ValueError:
-                    await websocket.send_json({"index": index, "url": url, "status": "Invalid", "comment": "Improper URL structure", "serverName": "N/A", "redirectChain": []})
-                    continue
-                tasks.append(asyncio.create_task(bound_check(url, index, client)))
+                tasks.append(asyncio.create_task(bound_check(url, client)))
 
             for future in asyncio.as_completed(tasks):
                 result = await future
                 await websocket.send_json(result)
         
-        await websocket.send_json({"status": "done"})
-    except Exception:
-        pass # Client disconnects are handled gracefully
+        await websocket.send_json({"done": True})
+    except WebSocketDisconnect:
+        logger.info("Client disconnected.")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
     finally:
-        logger.info("Processing complete. Closing connection.")
+        logger.info("Connection closed.")
 
+# --- FIX #2: Replace the broken FileResponse with a simple status message ---
 @app.get("/")
-async def read_index(): return FileResponse('index.html')
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+async def root():
+    return {"status": "ok", "message": "URL Journey Backend is running"}

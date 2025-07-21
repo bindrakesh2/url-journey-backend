@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     async with async_playwright() as p:
         browser = None
         try:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
             app.state.browser = browser
             logger.info("Browser launched successfully and is ready for requests.")
             yield
@@ -110,8 +110,6 @@ def get_server_name(headers: dict, url: str) -> str:
 # --- Core Analysis Logic ---
 async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSocket):
     context = None
-    
-    # --- THIS IS THE MODIFIED ERROR HANDLING BLOCK ---
     try:
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -148,39 +146,17 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         result = {"originalURL": url, "finalURL": final_url, "redirectChain": redirect_chain, "totalTime": time.time() - start_time}
         await websocket.send_text(json.dumps(result))
 
-    except TooManyRedirectsError:
-        error_comment = "Browser detected too many redirects"
-        logger.warning(f"Too many redirects for {url}")
-        result = {"originalURL": url, "error": error_comment}
-        await websocket.send_text(json.dumps(result))
-        
-    except PlaywrightTimeoutError:
-        error_comment = "Navigation timed out after 60s"
-        logger.warning(f"Timeout error for {url}")
-        result = {"originalURL": url, "error": error_comment}
-        await websocket.send_text(json.dumps(result))
-
-    except PlaywrightError as e:
-        # Catch specific navigation errors like DNS failures
-        error_str = str(e)
-        if "ERR_NAME_NOT_RESOLVED" in error_str:
+    except (PlaywrightTimeoutError, PlaywrightError) as e:
+        error_comment = "An error occurred during navigation"
+        if isinstance(e, PlaywrightTimeoutError):
+            error_comment = "Navigation timed out after 60s"
+        elif "net::ERR_NAME_NOT_RESOLVED" in str(e):
             error_comment = "Navigation failed: DNS resolution error"
         else:
             error_comment = "Navigation failed: Could not load page"
-        logger.warning(f"Playwright navigation error for {url}: {error_comment}")
+        
+        logger.warning(f"Error for {url}: {error_comment}")
         result = {"originalURL": url, "error": error_comment}
-        await websocket.send_text(json.dumps(result))
-
-    except asyncio.CancelledError:
-        logger.info(f"Task for {url} was cancelled because client disconnected.")
-        # Do not send a message as the client is gone
-
-    except Exception as e:
-        # Generic catch-all for any other unexpected errors
-        error_comment = "A critical server error occurred"
-        logger.error(f"Critical error fetching {url}: {e}", exc_info=True)
-        result = {"originalURL": url, "error": error_comment}
-        # Check if client is still connected before sending
         if websocket.client_state.name == 'CONNECTED':
             await websocket.send_text(json.dumps(result))
             
@@ -188,13 +164,21 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         if context:
             await context.close()
 
-
-# --- The rest of the file is unchanged ---
+# --- MODIFIED: More robust validation ---
 async def validate_url(url: str) -> str:
+    # First, strip any leading/trailing whitespace
+    url = url.strip()
+    
+    # If the url is empty after stripping, it's invalid
+    if not url:
+        raise ValueError("URL cannot be empty")
+        
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
+        
     if not validators.url(url):
-        raise ValueError(f"Invalid URL: {url}")
+        raise ValueError(f"Invalid URL format")
+        
     return url
 
 @app.websocket("/analyze")
@@ -204,37 +188,56 @@ async def analyze_urls_websocket(websocket: WebSocket):
     semaphore = asyncio.Semaphore(5)
 
     async def limited_fetch(url):
-        async with semaphore:
-            await fetch_url_with_playwright(browser, url, websocket)
+        """ Wrapper to catch any critical error during a single fetch. """
+        try:
+            async with semaphore:
+                await fetch_url_with_playwright(browser, url, websocket)
+        except Exception as e:
+            logger.error(f"A critical error in the fetch task for {url} was caught: {e}", exc_info=True)
+            error_result = {"originalURL": url, "error": "A critical processing error occurred"}
+            if websocket.client_state.name == 'CONNECTED':
+                await websocket.send_json(error_result)
 
     active_tasks = []
     try:
         data = await websocket.receive_json()
-        urls = list(set(filter(None, data.get("urls", []))))
-        validated_urls = []
-        for url in urls:
-            try:
-                validated_urls.append(await validate_url(url))
-            except ValueError:
-                await websocket.send_text(json.dumps({"error": f"Invalid URL format", "originalURL": url}))
         
-        valid_urls_only = [u for u in validated_urls if u]
-        for url in valid_urls_only:
+        # --- MODIFIED: Cleaner URL processing ---
+        # Get raw URLs, strip whitespace, and filter out empty lines
+        raw_urls = data.get("urls", [])
+        cleaned_urls = [u.strip() for u in raw_urls if u.strip()]
+        # Remove duplicates while preserving original order
+        urls_to_process = list(dict.fromkeys(cleaned_urls))
+
+        validated_urls = []
+        for url in urls_to_process:
+            try:
+                # The validation function now handles stripping
+                validated_urls.append(await validate_url(url))
+            except ValueError as e:
+                # Send a specific error message for the URL that failed validation
+                error_message = f"{e}: {url}"
+                await websocket.send_text(json.dumps({"error": error_message, "originalURL": url}))
+        
+        for url in validated_urls:
             await websocket.send_text(json.dumps({"status": "processing", "url": url}))
         
-        for url in valid_urls_only:
+        for url in validated_urls:
             task = asyncio.create_task(limited_fetch(url))
             active_tasks.append(task)
         
-        await asyncio.gather(*active_tasks, return_exceptions=True)
+        if active_tasks:
+            await asyncio.gather(*active_tasks)
         
         if websocket.client_state.name == 'CONNECTED':
             await websocket.send_text(json.dumps({"done": True}))
+            
     except WebSocketDisconnect:
         logger.info("Client disconnected. Cancelling all outstanding analysis tasks.")
         for task in active_tasks:
             task.cancel()
-        await asyncio.gather(*active_tasks, return_exceptions=True)
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
         logger.info("All tasks cancelled.")
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)

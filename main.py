@@ -5,9 +5,9 @@ import logging
 import socket
 import ipaddress
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-# Make sure to import CORSMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import urlparse
+import time
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO)
@@ -16,20 +16,18 @@ logger = logging.getLogger(__name__)
 # --- FastAPI App Initialization ---
 app = FastAPI()
 
-# --- FIX #1: Add CORS Middleware ---
-# List of domains that are allowed to connect to your backend.
+# --- CORS Middleware ---
 origins = [
-    "http://localhost:3000",          # For your local React development
-    "https://urljourney.netlify.app", # Your deployed React frontend
-    # Add any other frontend URLs you use
+    "http://localhost:3000",
+    "https://urljourney.netlify.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"], # Allows all methods
-    allow_headers=["*"], # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- Server Name Detection Logic (omitted for brevity, no changes here) ---
@@ -77,7 +75,6 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     return "Unknown"
 
 async def check_url_status(client: httpx.AsyncClient, url: str):
-    # This function is simplified to match the React frontend's expected data structure
     start_time = time.time()
     redirect_chain = []
     current_url = url
@@ -101,14 +98,13 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
                 if not target_url:
                     raise Exception("Redirect missing location header")
                 
-                # Handle relative redirects
                 if target_url.startswith('/'):
                     base = urlparse(current_url)
                     target_url = f"{base.scheme}://{base.netloc}{target_url}"
                 current_url = target_url
             else:
                 response.raise_for_status()
-                break # Exit loop on a non-redirect
+                break
         else:
             raise Exception("Too many redirects")
 
@@ -138,11 +134,10 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
-        # The React code sends a JSON object with a 'urls' key
         data = await websocket.receive_json()
         urls = data.get("urls", [])
         
-        CONCURRENCY_LIMIT = 50 # Reduced for stability
+        CONCURRENCY_LIMIT = 50
         semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
         async def bound_check(url, client):
@@ -152,7 +147,6 @@ async def websocket_endpoint(websocket: WebSocket):
         async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=100)) as client:
             tasks = []
             for url in urls:
-                # The React frontend doesn't need "processing" messages, so we remove them
                 if not url.startswith(("http://", "https://")): url = f"https://{url}"
                 tasks.append(asyncio.create_task(bound_check(url, client)))
 
@@ -168,7 +162,11 @@ async def websocket_endpoint(websocket: WebSocket):
     finally:
         logger.info("Connection closed.")
 
-# --- FIX #2: Replace the broken FileResponse with a simple status message ---
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "URL Journey Backend is running"}
+
+# --- FIX #2: Added the /test route back ---
+@app.get("/test")
+async def test():
+    return {"status": "ok", "message": "Test endpoint is healthy"}

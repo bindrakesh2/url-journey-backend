@@ -1,5 +1,4 @@
 # main.py
-
 import asyncio
 import sys
 
@@ -32,22 +31,22 @@ class TooManyRedirectsError(Exception):
 async def lifespan(app: FastAPI):
     """Handles startup and shutdown to manage a single browser instance."""
     logger.info("Application startup: Launching browser...")
-    async with async_playwright() as p:
-        browser = None
-        try:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-            app.state.browser = browser
-            logger.info("Browser launched successfully and is ready for requests.")
-            yield
-        finally:
-            if browser:
-                try:
-                    logger.info("Attempting to gracefully close the browser...")
-                    await asyncio.wait_for(browser.close(), timeout=5.0)
-                    logger.info("Browser closed successfully.")
-                except asyncio.TimeoutError:
-                    logger.warning("Browser did not close within 5 seconds. The process will now exit.")
-            logger.info("Application shutdown complete.")
+    browser_instance = None
+    try:
+        p = await async_playwright().start()
+        browser_instance = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        app.state.browser = browser_instance
+        logger.info("Browser launched successfully and is ready for requests.")
+        yield
+    finally:
+        if browser_instance:
+            try:
+                logger.info("Attempting to gracefully close the browser...")
+                await browser_instance.close()
+                logger.info("Browser closed successfully.")
+            except Exception as e:
+                logger.warning(f"Error closing browser: {e}")
+        logger.info("Application shutdown complete.")
 
 # --- FastAPI App Initialization ---
 app = FastAPI(lifespan=lifespan)
@@ -91,7 +90,7 @@ def get_server_name(headers: dict, url: str) -> str:
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
-        if "apache" in server_value: return "Apache"
+        if "apache" in server_value: return "Apache (AEM)"
         return server_value.capitalize()
     server_timing = headers.get("server-timing", "")
     has_akamai_cache = "cdn-cache; desc=HIT" in server_timing or "cdn-cache; desc=MISS" in server_timing
@@ -101,17 +100,15 @@ def get_server_name(headers: dict, url: str) -> str:
     has_dispatcher = "x-dispatcher" in headers or "x-aem-instance" in headers
     has_aem_paths = any("/etc.clientlibs" in v for h, v in headers.items() if h in ["link", "baqend-tags"])
     if has_akamai_cache or has_akamai_request_id or (server_timing and is_akamai):
-        if has_aem_paths or has_dispatcher: return "Apache"
+        if has_aem_paths or has_dispatcher: return "Apache (AEM)"
         return "Akamai"
-    if has_dispatcher or has_aem_paths: return "Apache"
+    if has_dispatcher or has_aem_paths: return "Apache (AEM)"
     if is_akamai: return "Akamai"
     return "Unknown"
 
-# --- Core Analysis Logic ---
+# --- CORE ANALYSIS LOGIC WITH ROBUST ERROR HANDLING ---
 async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSocket):
     context = None
-    
-    # --- THIS IS THE MODIFIED ERROR HANDLING BLOCK ---
     try:
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -119,7 +116,6 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         )
         page = await context.new_page()
         page.on("pageerror", lambda exc: logger.error(f"Page Error on {url}: {exc}"))
-
         await page.route("**/*", lambda route: route.abort() if route.request.resource_type in {"image", "stylesheet", "font", "media"} else route.continue_())
         
         redirect_chain = []
@@ -146,41 +142,29 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
             redirect_chain.append(hop)
         
         result = {"originalURL": url, "finalURL": final_url, "redirectChain": redirect_chain, "totalTime": time.time() - start_time}
-        await websocket.send_text(json.dumps(result))
+        if websocket.client_state.name == 'CONNECTED':
+            await websocket.send_text(json.dumps(result))
 
-    except TooManyRedirectsError:
-        error_comment = "Browser detected too many redirects"
-        logger.warning(f"Too many redirects for {url}")
-        result = {"originalURL": url, "error": error_comment}
-        await websocket.send_text(json.dumps(result))
-        
-    except PlaywrightTimeoutError:
-        error_comment = "Navigation timed out after 60s"
-        logger.warning(f"Timeout error for {url}")
-        result = {"originalURL": url, "error": error_comment}
-        await websocket.send_text(json.dumps(result))
-
-    except PlaywrightError as e:
-        # Catch specific navigation errors like DNS failures
-        error_str = str(e)
-        if "ERR_NAME_NOT_RESOLVED" in error_str:
+    except (PlaywrightTimeoutError, TooManyRedirectsError, PlaywrightError) as e:
+        error_comment = "An error occurred during navigation"
+        if isinstance(e, PlaywrightTimeoutError):
+            error_comment = "Navigation timed out after 60s"
+        elif isinstance(e, TooManyRedirectsError):
+            error_comment = "Browser detected too many redirects"
+        elif "ERR_NAME_NOT_RESOLVED" in str(e):
             error_comment = "Navigation failed: DNS resolution error"
         else:
             error_comment = "Navigation failed: Could not load page"
-        logger.warning(f"Playwright navigation error for {url}: {error_comment}")
+        
+        logger.warning(f"Error for {url}: {error_comment}")
         result = {"originalURL": url, "error": error_comment}
-        await websocket.send_text(json.dumps(result))
-
-    except asyncio.CancelledError:
-        logger.info(f"Task for {url} was cancelled because client disconnected.")
-        # Do not send a message as the client is gone
+        if websocket.client_state.name == 'CONNECTED':
+            await websocket.send_text(json.dumps(result))
 
     except Exception as e:
-        # Generic catch-all for any other unexpected errors
         error_comment = "A critical server error occurred"
         logger.error(f"Critical error fetching {url}: {e}", exc_info=True)
         result = {"originalURL": url, "error": error_comment}
-        # Check if client is still connected before sending
         if websocket.client_state.name == 'CONNECTED':
             await websocket.send_text(json.dumps(result))
             
@@ -188,56 +172,55 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         if context:
             await context.close()
 
+# --- WebSocket Handler ---
+@app.websocket("/analyze")
+async def analyze_urls_websocket(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("connection open")
+    try:
+        browser = websocket.app.state.browser
+        semaphore = asyncio.Semaphore(10) # Increased semaphore for single worker
 
-# --- The rest of the file is unchanged ---
+        async def limited_fetch(url):
+            # This inner function ensures that even if one fetch fails, it doesn't crash the gather
+            try:
+                await fetch_url_with_playwright(browser, url, websocket)
+            except Exception as e:
+                logger.error(f"Unhandled exception in limited_fetch for {url}: {e}")
+                result = {"originalURL": url, "error": "Processing failed unexpectedly"}
+                if websocket.client_state.name == 'CONNECTED':
+                    await websocket.send_text(json.dumps(result))
+
+        data = await websocket.receive_json()
+        urls = list(set(filter(None, data.get("urls", []))))
+        tasks = []
+        for url_str in urls:
+            try:
+                validated_url = await validate_url(url_str)
+                task = asyncio.create_task(limited_fetch(validated_url))
+                tasks.append(task)
+            except ValueError:
+                await websocket.send_text(json.dumps({"error": f"Invalid URL format", "originalURL": url_str}))
+        
+        await asyncio.gather(*tasks)
+        
+        if websocket.client_state.name == 'CONNECTED':
+            await websocket.send_text(json.dumps({"done": True}))
+            
+    except WebSocketDisconnect:
+        logger.info("Client disconnected.")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+    finally:
+        logger.info("connection closed")
+
+
 async def validate_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
     if not validators.url(url):
         raise ValueError(f"Invalid URL: {url}")
     return url
-
-@app.websocket("/analyze")
-async def analyze_urls_websocket(websocket: WebSocket):
-    await websocket.accept()
-    browser = websocket.app.state.browser
-    semaphore = asyncio.Semaphore(5)
-
-    async def limited_fetch(url):
-        async with semaphore:
-            await fetch_url_with_playwright(browser, url, websocket)
-
-    active_tasks = []
-    try:
-        data = await websocket.receive_json()
-        urls = list(set(filter(None, data.get("urls", []))))
-        validated_urls = []
-        for url in urls:
-            try:
-                validated_urls.append(await validate_url(url))
-            except ValueError:
-                await websocket.send_text(json.dumps({"error": f"Invalid URL format", "originalURL": url}))
-        
-        valid_urls_only = [u for u in validated_urls if u]
-        for url in valid_urls_only:
-            await websocket.send_text(json.dumps({"status": "processing", "url": url}))
-        
-        for url in valid_urls_only:
-            task = asyncio.create_task(limited_fetch(url))
-            active_tasks.append(task)
-        
-        await asyncio.gather(*active_tasks, return_exceptions=True)
-        
-        if websocket.client_state.name == 'CONNECTED':
-            await websocket.send_text(json.dumps({"done": True}))
-    except WebSocketDisconnect:
-        logger.info("Client disconnected. Cancelling all outstanding analysis tasks.")
-        for task in active_tasks:
-            task.cancel()
-        await asyncio.gather(*active_tasks, return_exceptions=True)
-        logger.info("All tasks cancelled.")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
 
 @app.get("/test")
 async def test():

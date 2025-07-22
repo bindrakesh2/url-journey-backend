@@ -20,7 +20,7 @@ app = FastAPI()
 origins = [
     "http://localhost:3000",
     "https://urljourney.netlify.app",
-    "*" # Using a wildcard for flexibility
+    "*"
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -30,13 +30,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper Functions ---
-def get_server_name(headers: dict) -> str:
+# --- ADVANCED SERVER NAME DETECTION LOGIC (from your original code) ---
+AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
+ip_cache = {}
+
+async def resolve_ip_async(hostname: str):
+    if not hostname: return None
+    if hostname in ip_cache: return ip_cache[hostname]
+    try:
+        ip = await asyncio.to_thread(socket.gethostbyname, hostname)
+        ip_cache[hostname] = ip
+        return ip
+    except (socket.gaierror, TypeError): return None
+
+def is_akamai_ip(ip: str) -> bool:
+    if not ip: return False
+    try:
+        addr = ipaddress.ip_address(ip)
+        for cidr in AKAMAI_IP_RANGES:
+            if addr in ipaddress.ip_network(cidr): return True
+    except ValueError: pass
+    return False
+
+async def get_server_name_advanced(headers: dict, url: str) -> str:
+    headers = {k.lower(): v for k, v in headers.items()}
+    hostname = urlparse(url).hostname
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
         if "apache" in server_value: return "Apache (AEM)"
         return server_value.capitalize()
+    
+    ip = await resolve_ip_async(hostname)
+    if is_akamai_ip(ip):
+        return "Akamai"
+        
     return "Unknown"
 
 # --- Core URL Analysis Logic (httpx version) ---
@@ -49,7 +77,8 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
     try:
         for _ in range(MAX_REDIRECTS):
             response = await client.get(current_url, follow_redirects=False, timeout=30.0)
-            server_name = get_server_name(response.headers)
+            # Use the advanced server name detection
+            server_name = await get_server_name_advanced(response.headers, str(response.url))
             
             hop_info = {
                 "url": str(response.url), 
@@ -64,11 +93,10 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
                 if not target_url:
                     raise Exception("Redirect missing location header")
                 
-                # Resolve relative URLs to absolute URLs
                 current_url = urljoin(str(response.url), target_url)
             else:
                 response.raise_for_status()
-                break # Exit loop on a final, non-redirect status
+                break
         else:
             raise Exception("Too many redirects")
 
@@ -88,7 +116,6 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
         else:
             error_message = str(e)
 
-        # Ensure the final object for the frontend is consistent
         return {
             "originalURL": url,
             "finalURL": current_url if current_url != url else None,
@@ -104,7 +131,7 @@ async def websocket_endpoint(websocket: WebSocket):
         data = await websocket.receive_json()
         urls = data.get("urls", [])
         
-        CONCURRENCY_LIMIT = 100 # We can use higher concurrency with httpx
+        CONCURRENCY_LIMIT = 100
         semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
         async def bound_check(url, client):
@@ -114,7 +141,7 @@ async def websocket_endpoint(websocket: WebSocket):
         async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200)) as client:
             tasks = []
             for url_str in urls:
-                if url_str.strip(): # Process only non-empty URLs
+                if url_str.strip():
                     tasks.append(asyncio.create_task(bound_check(url_str.strip(), client)))
 
             for future in asyncio.as_completed(tasks):

@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- ADVANCED SERVER NAME DETECTION LOGIC (RESTORED) ---
+# --- Advanced Server Name Detection Logic (Unchanged) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
 
@@ -38,7 +38,6 @@ async def resolve_ip_async(hostname: str):
     if not hostname: return None
     if hostname in ip_cache: return ip_cache[hostname]
     try:
-        # Run the blocking socket call in a separate thread to avoid freezing the app
         ip = await asyncio.to_thread(socket.gethostbyname, hostname)
         ip_cache[hostname] = ip
         return ip
@@ -54,31 +53,23 @@ def is_akamai_ip(ip: str) -> bool:
     return False
 
 async def get_server_name_advanced(headers: dict, url: str) -> str:
-    """This is the fully restored, sophisticated server name detection function."""
     headers = {k.lower(): v for k, v in headers.items()}
     hostname = urlparse(url).hostname
-
-    # Rule 1: Check server header first
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
         if "apache" in server_value: return "Apache (AEM)"
         return server_value.capitalize()
     
-    # Rule 2: Check server-timing and other Akamai-specific headers
     server_timing = headers.get("server-timing", "")
     has_akamai_cache = "cdn-cache; desc=HIT" in server_timing or "cdn-cache; desc=MISS" in server_timing
     has_akamai_request_id = "x-akamai-request-id" in headers
-    
-    # Rule 3: Check for AEM-specific headers
     has_dispatcher = "x-dispatcher" in headers or "x-aem-instance" in headers
     has_aem_paths = any("/etc.clientlibs" in v for h, v in headers.items() if h in ["link", "baqend-tags"])
     
-    # Rule 4: Resolve IP and check if it's in Akamai's known ranges
     ip = await resolve_ip_async(hostname)
     is_akamai = is_akamai_ip(ip)
 
-    # Rule 5: Apply logic based on findings
     if has_akamai_cache or has_akamai_request_id or (server_timing and is_akamai):
         if has_aem_paths or has_dispatcher: return "Apache (AEM)"
         return "Akamai"
@@ -88,61 +79,62 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     
     return "Unknown"
 
-# --- Core URL Analysis Logic (httpx version) ---
+# --- CORE URL ANALYSIS LOGIC (with resilient redirect tracing) ---
 async def check_url_status(client: httpx.AsyncClient, url: str):
     start_time = time.time()
     redirect_chain = []
     current_url = url
+    error_message = None
     MAX_REDIRECTS = 15
 
     try:
         for _ in range(MAX_REDIRECTS):
-            response = await client.get(current_url, follow_redirects=False, timeout=30.0)
-            server_name = await get_server_name_advanced(response.headers, str(response.url))
-            
-            hop_info = {
-                "url": str(response.url), 
-                "status": response.status_code, 
-                "server": server_name,
-                "timestamp": time.time() - start_time
-            }
-            redirect_chain.append(hop_info)
-            
-            if response.is_redirect:
-                target_url = response.headers.get('location')
-                if not target_url:
-                    raise Exception("Redirect missing location header")
+            try:
+                response = await client.get(current_url, follow_redirects=False, timeout=30.0)
+                server_name = await get_server_name_advanced(response.headers, str(response.url))
                 
-                current_url = urljoin(str(response.url), target_url)
-            else:
-                response.raise_for_status()
-                break
-        else:
-            raise Exception("Too many redirects")
+                hop_info = {
+                    "url": str(response.url), 
+                    "status": response.status_code, 
+                    "server": server_name,
+                    "timestamp": time.time() - start_time
+                }
+                redirect_chain.append(hop_info)
 
-        return {
-            "originalURL": url, 
-            "finalURL": current_url,
-            "redirectChain": redirect_chain,
-            "totalTime": time.time() - start_time
-        }
+                if response.is_redirect:
+                    target_url = response.headers.get('location')
+                    if not target_url:
+                        raise Exception("Redirect missing location header")
+                    current_url = urljoin(str(response.url), target_url)
+                else:
+                    # Final destination is not a redirect, check for errors
+                    response.raise_for_status()
+                    break # Success, end of the chain
+            
+            except httpx.HTTPStatusError as e:
+                # The final destination is an error page (e.g., 404)
+                # The hop_info was already added, so we just break the loop
+                break
+
+        if len(redirect_chain) >= MAX_REDIRECTS:
+             error_message = "Too many redirects"
 
     except Exception as e:
-        error_message = "An error occurred"
-        if isinstance(e, httpx.HTTPStatusError):
-            error_message = f"HTTP Error: {e.response.status_code}"
-        elif isinstance(e, httpx.RequestError):
+        if isinstance(e, httpx.RequestError):
             error_message = "Request failed (e.g., DNS or network error)"
         else:
             error_message = str(e)
 
-        return {
-            "originalURL": url,
-            "finalURL": current_url if current_url != url else None,
-            "redirectChain": redirect_chain,
-            "totalTime": time.time() - start_time,
-            "error": error_message
-        }
+    final_result = {
+        "originalURL": url,
+        "finalURL": redirect_chain[-1]['url'] if redirect_chain else url,
+        "redirectChain": redirect_chain,
+        "totalTime": time.time() - start_time,
+    }
+    if error_message:
+        final_result["error"] = error_message
+
+    return final_result
 
 @app.websocket("/analyze")
 async def websocket_endpoint(websocket: WebSocket):

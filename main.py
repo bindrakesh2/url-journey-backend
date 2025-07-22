@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Advanced Server Name Detection Logic (Unchanged) ---
+# --- Advanced Server Name Detection Logic ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
 
@@ -55,6 +55,13 @@ def is_akamai_ip(ip: str) -> bool:
 async def get_server_name_advanced(headers: dict, url: str) -> str:
     headers = {k.lower(): v for k, v in headers.items()}
     hostname = urlparse(url).hostname
+
+    # --- THIS IS THE RESTORED LOGIC BLOCK ---
+    if hostname and ("bmw" in hostname.lower() or "mini" in hostname.lower()):
+        if "cache-control" in headers:
+            return "Apache (AEM)"
+    # --- END OF RESTORED LOGIC ---
+
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
@@ -64,6 +71,7 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     server_timing = headers.get("server-timing", "")
     has_akamai_cache = "cdn-cache; desc=HIT" in server_timing or "cdn-cache; desc=MISS" in server_timing
     has_akamai_request_id = "x-akamai-request-id" in headers
+    
     has_dispatcher = "x-dispatcher" in headers or "x-aem-instance" in headers
     has_aem_paths = any("/etc.clientlibs" in v for h, v in headers.items() if h in ["link", "baqend-tags"])
     
@@ -79,7 +87,7 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     
     return "Unknown"
 
-# --- CORE URL ANALYSIS LOGIC (with resilient redirect tracing) ---
+# --- Core URL Analysis Logic (Unchanged) ---
 async def check_url_status(client: httpx.AsyncClient, url: str):
     start_time = time.time()
     redirect_chain = []
@@ -107,13 +115,10 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
                         raise Exception("Redirect missing location header")
                     current_url = urljoin(str(response.url), target_url)
                 else:
-                    # Final destination is not a redirect, check for errors
                     response.raise_for_status()
-                    break # Success, end of the chain
+                    break 
             
             except httpx.HTTPStatusError as e:
-                # The final destination is an error page (e.g., 404)
-                # The hop_info was already added, so we just break the loop
                 break
 
         if len(redirect_chain) >= MAX_REDIRECTS:

@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Advanced Server Name Detection Logic ---
+# --- Advanced Server Name Detection Logic (Unchanged) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
 
@@ -55,13 +55,9 @@ def is_akamai_ip(ip: str) -> bool:
 async def get_server_name_advanced(headers: dict, url: str) -> str:
     headers = {k.lower(): v for k, v in headers.items()}
     hostname = urlparse(url).hostname
-
-    # --- THIS IS THE RESTORED LOGIC BLOCK ---
     if hostname and ("bmw" in hostname.lower() or "mini" in hostname.lower()):
         if "cache-control" in headers:
             return "Apache (AEM)"
-    # --- END OF RESTORED LOGIC ---
-
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
@@ -71,7 +67,6 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     server_timing = headers.get("server-timing", "")
     has_akamai_cache = "cdn-cache; desc=HIT" in server_timing or "cdn-cache; desc=MISS" in server_timing
     has_akamai_request_id = "x-akamai-request-id" in headers
-    
     has_dispatcher = "x-dispatcher" in headers or "x-aem-instance" in headers
     has_aem_paths = any("/etc.clientlibs" in v for h, v in headers.items() if h in ["link", "baqend-tags"])
     
@@ -79,7 +74,7 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     is_akamai = is_akamai_ip(ip)
 
     if has_akamai_cache or has_akamai_request_id or (server_timing and is_akamai):
-        if has_aem_paths or has_dispatcher: return "Apache (AEM)"
+        if has_aem_paths or ahas_dispatcher: return "Apache (AEM)"
         return "Akamai"
     
     if has_dispatcher or has_aem_paths: return "Apache (AEM)"
@@ -87,7 +82,7 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     
     return "Unknown"
 
-# --- Core URL Analysis Logic (Unchanged) ---
+# --- CORE URL ANALYSIS LOGIC (with resilient redirect tracing) ---
 async def check_url_status(client: httpx.AsyncClient, url: str):
     start_time = time.time()
     redirect_chain = []
@@ -97,6 +92,7 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
 
     try:
         for _ in range(MAX_REDIRECTS):
+            response = None
             try:
                 response = await client.get(current_url, follow_redirects=False, timeout=30.0)
                 server_name = await get_server_name_advanced(response.headers, str(response.url))
@@ -115,10 +111,14 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
                         raise Exception("Redirect missing location header")
                     current_url = urljoin(str(response.url), target_url)
                 else:
+                    # Final destination is not a redirect, check for HTTP errors (4xx, 5xx)
                     response.raise_for_status()
-                    break 
+                    break # Success, end of the chain
             
-            except httpx.HTTPStatusError as e:
+            except httpx.HTTPStatusError:
+                # This catches the final broken page (e.g., 404)
+                # The hop_info for this error was already added above.
+                # We break the loop because this is the end of the chain.
                 break
 
         if len(redirect_chain) >= MAX_REDIRECTS:
@@ -136,6 +136,7 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
         "redirectChain": redirect_chain,
         "totalTime": time.time() - start_time,
     }
+    # Only add the top-level error for catastrophic failures, not for chains ending in 404.
     if error_message:
         final_result["error"] = error_message
 

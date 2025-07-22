@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- ADVANCED SERVER NAME DETECTION LOGIC (from your original code) ---
+# --- ADVANCED SERVER NAME DETECTION LOGIC (RESTORED) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
 
@@ -38,6 +38,7 @@ async def resolve_ip_async(hostname: str):
     if not hostname: return None
     if hostname in ip_cache: return ip_cache[hostname]
     try:
+        # Run the blocking socket call in a separate thread to avoid freezing the app
         ip = await asyncio.to_thread(socket.gethostbyname, hostname)
         ip_cache[hostname] = ip
         return ip
@@ -53,18 +54,38 @@ def is_akamai_ip(ip: str) -> bool:
     return False
 
 async def get_server_name_advanced(headers: dict, url: str) -> str:
+    """This is the fully restored, sophisticated server name detection function."""
     headers = {k.lower(): v for k, v in headers.items()}
     hostname = urlparse(url).hostname
+
+    # Rule 1: Check server header first
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
         if "apache" in server_value: return "Apache (AEM)"
         return server_value.capitalize()
     
+    # Rule 2: Check server-timing and other Akamai-specific headers
+    server_timing = headers.get("server-timing", "")
+    has_akamai_cache = "cdn-cache; desc=HIT" in server_timing or "cdn-cache; desc=MISS" in server_timing
+    has_akamai_request_id = "x-akamai-request-id" in headers
+    
+    # Rule 3: Check for AEM-specific headers
+    has_dispatcher = "x-dispatcher" in headers or "x-aem-instance" in headers
+    has_aem_paths = any("/etc.clientlibs" in v for h, v in headers.items() if h in ["link", "baqend-tags"])
+    
+    # Rule 4: Resolve IP and check if it's in Akamai's known ranges
     ip = await resolve_ip_async(hostname)
-    if is_akamai_ip(ip):
+    is_akamai = is_akamai_ip(ip)
+
+    # Rule 5: Apply logic based on findings
+    if has_akamai_cache or has_akamai_request_id or (server_timing and is_akamai):
+        if has_aem_paths or has_dispatcher: return "Apache (AEM)"
         return "Akamai"
-        
+    
+    if has_dispatcher or has_aem_paths: return "Apache (AEM)"
+    if is_akamai: return "Akamai"
+    
     return "Unknown"
 
 # --- Core URL Analysis Logic (httpx version) ---
@@ -77,7 +98,6 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
     try:
         for _ in range(MAX_REDIRECTS):
             response = await client.get(current_url, follow_redirects=False, timeout=30.0)
-            # Use the advanced server name detection
             server_name = await get_server_name_advanced(response.headers, str(response.url))
             
             hop_info = {

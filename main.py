@@ -82,7 +82,7 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     
     return "Unknown"
 
-# --- Core URL Analysis Logic (Unchanged) ---
+# --- Core URL Analysis Logic ---
 async def check_url_status(client: httpx.AsyncClient, url: str):
     start_time = time.time()
     redirect_chain = []
@@ -108,7 +108,14 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
                     target_url = response.headers.get('location')
                     if not target_url:
                         raise Exception("Redirect missing location header")
-                    current_url = urljoin(str(response.url), target_url)
+
+                    next_url = urljoin(str(response.url), target_url)
+
+                    # --- NEW: Check for immediate self-redirect loop ---
+                    if next_url == current_url:
+                        raise Exception("URL redirects to itself in a loop")
+                    
+                    current_url = next_url
                 else:
                     response.raise_for_status()
                     break 
@@ -149,9 +156,7 @@ async def websocket_endpoint(websocket: WebSocket):
         async def bound_check(url, client):
             async with semaphore:
                 return await check_url_status(client, url)
-        
-        # --- THIS IS THE MODIFIED LINE ---
-        # Added verify=False to ignore SSL certificate errors
+
         async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False) as client:
             tasks = []
             for url_str in urls:

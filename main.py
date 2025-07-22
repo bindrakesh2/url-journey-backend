@@ -30,6 +30,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- NEW: Add a standard browser User-Agent header ---
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
 # --- Advanced Server Name Detection Logic (Unchanged) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
@@ -57,11 +62,11 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     hostname = urlparse(url).hostname
     if hostname and ("bmw" in hostname.lower() or "mini" in hostname.lower()):
         if "cache-control" in headers:
-            return "Apache"
+            return "Apache (AEM)"
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
-        if "apache" in server_value: return "Apache"
+        if "apache" in server_value: return "Apache (AEM)"
         return server_value.capitalize()
     
     server_timing = headers.get("server-timing", "")
@@ -74,15 +79,15 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     is_akamai = is_akamai_ip(ip)
 
     if has_akamai_cache or has_akamai_request_id or (server_timing and is_akamai):
-        if has_aem_paths or has_dispatcher: return "Apache"
+        if has_aem_paths or has_dispatcher: return "Apache (AEM)"
         return "Akamai"
     
-    if has_dispatcher or has_aem_paths: return "Apache"
+    if has_dispatcher or has_aem_paths: return "Apache (AEM)"
     if is_akamai: return "Akamai"
     
     return "Unknown"
 
-# --- Core URL Analysis Logic ---
+# --- Core URL Analysis Logic (Unchanged) ---
 async def check_url_status(client: httpx.AsyncClient, url: str):
     start_time = time.time()
     redirect_chain = []
@@ -110,8 +115,7 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
                         raise Exception("Redirect missing location header")
 
                     next_url = urljoin(str(response.url), target_url)
-
-                    # --- NEW: Check for immediate self-redirect loop ---
+                    
                     if next_url == current_url:
                         raise Exception("URL redirects to itself in a loop")
                     
@@ -157,7 +161,9 @@ async def websocket_endpoint(websocket: WebSocket):
             async with semaphore:
                 return await check_url_status(client, url)
 
-        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False) as client:
+        # --- MODIFIED THIS LINE ---
+        # Added headers=BROWSER_HEADERS to make requests look like a real browser
+        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False, headers=BROWSER_HEADERS) as client:
             tasks = []
             for url_str in urls:
                 url = url_str.strip()

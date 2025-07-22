@@ -57,11 +57,11 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     hostname = urlparse(url).hostname
     if hostname and ("bmw" in hostname.lower() or "mini" in hostname.lower()):
         if "cache-control" in headers:
-            return "Apache (AEM)"
+            return "Apache"
     server_value = headers.get("server", "").lower()
     if server_value:
         if "akamai" in server_value or "ghost" in server_value: return "Akamai"
-        if "apache" in server_value: return "Apache (AEM)"
+        if "apache" in server_value: return "Apache"
         return server_value.capitalize()
     
     server_timing = headers.get("server-timing", "")
@@ -74,10 +74,10 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     is_akamai = is_akamai_ip(ip)
 
     if has_akamai_cache or has_akamai_request_id or (server_timing and is_akamai):
-        if has_aem_paths or has_dispatcher: return "Apache (AEM)"
+        if has_aem_paths or has_dispatcher: return "Apache"
         return "Akamai"
     
-    if has_dispatcher or has_aem_paths: return "Apache (AEM)"
+    if has_dispatcher or has_aem_paths: return "Apache"
     if is_akamai: return "Akamai"
     
     return "Unknown"

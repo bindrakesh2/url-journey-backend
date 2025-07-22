@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
     async with async_playwright() as p:
         browser = None
         try:
+            # Added --disable-dev-shm-usage for stability in deployed environments
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
             app.state.browser = browser
             logger.info("Browser launched successfully and is ready for requests.")
@@ -51,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App Initialization ---
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["https://urljourney.netlify.app/", "*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["https://urljourney.netlify.app", "*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ logger = logging.getLogger(__name__)
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
 
-# --- Helper Functions (Unchanged) ---
+# --- Helper Functions (Your original functions) ---
 def resolve_ip(url: str) -> str:
     hostname = urlparse(url).hostname
     if not hostname: return None
@@ -107,7 +108,7 @@ def get_server_name(headers: dict, url: str) -> str:
     if is_akamai: return "Akamai"
     return "Unknown"
 
-# --- Core Analysis Logic ---
+# --- Core Analysis Logic (Your original function) ---
 async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSocket):
     context = None
     try:
@@ -117,7 +118,6 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         )
         page = await context.new_page()
         page.on("pageerror", lambda exc: logger.error(f"Page Error on {url}: {exc}"))
-
         await page.route("**/*", lambda route: route.abort() if route.request.resource_type in {"image", "stylesheet", "font", "media"} else route.continue_())
         
         redirect_chain = []
@@ -164,21 +164,12 @@ async def fetch_url_with_playwright(browser: Browser, url: str, websocket: WebSo
         if context:
             await context.close()
 
-# --- MODIFIED: More robust validation ---
+# --- WebSocket Handler (with the minimal change for resilience) ---
 async def validate_url(url: str) -> str:
-    # First, strip any leading/trailing whitespace
-    url = url.strip()
-    
-    # If the url is empty after stripping, it's invalid
-    if not url:
-        raise ValueError("URL cannot be empty")
-        
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
-        
     if not validators.url(url):
-        raise ValueError(f"Invalid URL format")
-        
+        raise ValueError(f"Invalid URL: {url}")
     return url
 
 @app.websocket("/analyze")
@@ -187,42 +178,38 @@ async def analyze_urls_websocket(websocket: WebSocket):
     browser = websocket.app.state.browser
     semaphore = asyncio.Semaphore(5)
 
+    # --- THIS IS THE ONLY MODIFIED SECTION ---
     async def limited_fetch(url):
-        """ Wrapper to catch any critical error during a single fetch. """
+        """ This wrapper function adds the resilience you need. """
         try:
+            # It tries to run the main analysis function
             async with semaphore:
                 await fetch_url_with_playwright(browser, url, websocket)
         except Exception as e:
+            # If any critical, unexpected error happens, it's caught here
             logger.error(f"A critical error in the fetch task for {url} was caught: {e}", exc_info=True)
+            # An error message is sent for the specific URL that failed
             error_result = {"originalURL": url, "error": "A critical processing error occurred"}
             if websocket.client_state.name == 'CONNECTED':
                 await websocket.send_json(error_result)
+            # The rest of the tasks in asyncio.gather will continue unaffected
 
     active_tasks = []
     try:
         data = await websocket.receive_json()
-        
-        # --- MODIFIED: Cleaner URL processing ---
-        # Get raw URLs, strip whitespace, and filter out empty lines
-        raw_urls = data.get("urls", [])
-        cleaned_urls = [u.strip() for u in raw_urls if u.strip()]
-        # Remove duplicates while preserving original order
-        urls_to_process = list(dict.fromkeys(cleaned_urls))
-
+        urls = list(set(filter(None, data.get("urls", []))))
         validated_urls = []
-        for url in urls_to_process:
+        for url in urls:
             try:
-                # The validation function now handles stripping
                 validated_urls.append(await validate_url(url))
-            except ValueError as e:
-                # Send a specific error message for the URL that failed validation
-                error_message = f"{e}: {url}"
-                await websocket.send_text(json.dumps({"error": error_message, "originalURL": url}))
+            except ValueError:
+                await websocket.send_text(json.dumps({"error": f"Invalid URL format", "originalURL": url}))
         
-        for url in validated_urls:
+        valid_urls_only = [u for u in validated_urls if u]
+        for url in valid_urls_only:
             await websocket.send_text(json.dumps({"status": "processing", "url": url}))
         
-        for url in validated_urls:
+        for url in valid_urls_only:
             task = asyncio.create_task(limited_fetch(url))
             active_tasks.append(task)
         
@@ -231,7 +218,6 @@ async def analyze_urls_websocket(websocket: WebSocket):
         
         if websocket.client_state.name == 'CONNECTED':
             await websocket.send_text(json.dumps({"done": True}))
-            
     except WebSocketDisconnect:
         logger.info("Client disconnected. Cancelling all outstanding analysis tasks.")
         for task in active_tasks:

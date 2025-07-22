@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Advanced Server Name Detection Logic ---
+# --- Advanced Server Name Detection Logic (Unchanged) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
 
@@ -73,7 +73,6 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     ip = await resolve_ip_async(hostname)
     is_akamai = is_akamai_ip(ip)
 
-    # --- FIX #1: Corrected the typo 'ahas_dispatcher' to 'has_dispatcher' ---
     if has_akamai_cache or has_akamai_request_id or (server_timing and is_akamai):
         if has_aem_paths or has_dispatcher: return "Apache (AEM)"
         return "Akamai"
@@ -150,13 +149,14 @@ async def websocket_endpoint(websocket: WebSocket):
         async def bound_check(url, client):
             async with semaphore:
                 return await check_url_status(client, url)
-
-        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200)) as client:
+        
+        # --- THIS IS THE MODIFIED LINE ---
+        # Added verify=False to ignore SSL certificate errors
+        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False) as client:
             tasks = []
             for url_str in urls:
-                # --- FIX #2: Automatically add https:// to scheme-less URLs ---
                 url = url_str.strip()
-                if url: # Process only non-empty URLs
+                if url:
                     if not url.startswith(('http://', 'https://')):
                         url = f'https://{url}'
                     tasks.append(asyncio.create_task(bound_check(url, client)))

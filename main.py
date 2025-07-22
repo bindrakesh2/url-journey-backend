@@ -129,11 +129,12 @@ async def fetch_url_with_playwright(browser: Browser, url: str):
                     if not redirect_chain or redirect_chain[-1]["url"] != hop["url"]:
                         redirect_chain.append(hop)
                 except Exception as e:
-                    logger.error(f"Error in handle_response for {response.url}: {e}")
+                    logger.error(f"Error in handle_response for {url}: {e}")
 
         page.on("response", handle_response)
         
-        response = await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+        # --- MODIFIED: Stricter timeout to act as a safety valve ---
+        response = await page.goto(url, timeout=20000, wait_until="domcontentloaded") # 20 seconds
         
         final_url = page.url
         if not redirect_chain or redirect_chain[-1]['url'] != final_url:
@@ -147,7 +148,7 @@ async def fetch_url_with_playwright(browser: Browser, url: str):
     except Exception as e:
         error_comment = "An error occurred during navigation"
         if isinstance(e, PlaywrightTimeoutError):
-            error_comment = "Navigation timed out after 90s"
+            error_comment = "Navigation timed out after 20s"
         elif "Page crashed" in str(e):
             error_comment = "Navigation failed: Page crashed (out of memory)"
         elif "net::ERR_NAME_NOT_RESOLVED" in str(e):
@@ -162,7 +163,7 @@ async def fetch_url_with_playwright(browser: Browser, url: str):
         if context:
             await context.close()
 
-# --- WebSocket Handler ---
+
 @app.websocket("/analyze")
 async def analyze_urls_websocket(websocket: WebSocket):
     await websocket.accept()
@@ -186,7 +187,6 @@ async def analyze_urls_websocket(websocket: WebSocket):
         data = await websocket.receive_json()
         raw_urls = data.get("urls", [])
         
-        # Clean and de-duplicate URLs while preserving order
         cleaned_urls = [u.strip() for u in raw_urls if u.strip()]
         unique_urls = list(dict.fromkeys(cleaned_urls))
 

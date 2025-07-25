@@ -30,6 +30,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Browser User-Agent ---
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
 # --- Advanced Server Name Detection Logic (Unchanged) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
@@ -82,7 +87,7 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     
     return "Unknown"
 
-# --- Core URL Analysis Logic ---
+# --- Core URL Analysis Logic (Unchanged) ---
 async def check_url_status(client: httpx.AsyncClient, url: str):
     start_time = time.time()
     redirect_chain = []
@@ -93,7 +98,7 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
     try:
         for _ in range(MAX_REDIRECTS):
             try:
-                response = await client.get(current_url, follow_redirects=False, timeout=30.0)
+                response = await client.get(current_url, follow_redirects=False, timeout=60.0)
                 server_name = await get_server_name_advanced(response.headers, str(response.url))
                 
                 hop_info = {
@@ -108,10 +113,8 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
                     target_url = response.headers.get('location')
                     if not target_url:
                         raise Exception("Redirect missing location header")
-
+                    
                     next_url = urljoin(str(response.url), target_url)
-
-                    # --- NEW: Check for immediate self-redirect loop ---
                     if next_url == current_url:
                         raise Exception("URL redirects to itself in a loop")
                     
@@ -127,8 +130,10 @@ async def check_url_status(client: httpx.AsyncClient, url: str):
              error_message = "Too many redirects"
 
     except Exception as e:
-        if isinstance(e, httpx.RequestError):
-            error_message = "Request failed (e.g., DNS or network error)"
+        if isinstance(e, httpx.TimeoutException):
+            error_message = "Request timed out after 60s"
+        elif isinstance(e, httpx.RequestError):
+            error_message = "Request failed (Network/DNS error)"
         else:
             error_message = str(e)
 
@@ -150,14 +155,15 @@ async def websocket_endpoint(websocket: WebSocket):
         data = await websocket.receive_json()
         urls = data.get("urls", [])
         
-        CONCURRENCY_LIMIT = 100
+        # --- MODIFIED: Reduced concurrency to avoid rate limiting ---
+        CONCURRENCY_LIMIT = 20
         semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
         async def bound_check(url, client):
             async with semaphore:
                 return await check_url_status(client, url)
 
-        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False) as client:
+        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False, headers=BROWSER_HEADERS) as client:
             tasks = []
             for url_str in urls:
                 url = url_str.strip()

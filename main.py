@@ -30,11 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Browser User-Agent ---
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
-
 # --- Advanced Server Name Detection Logic (Unchanged) ---
 AKAMAI_IP_RANGES = ["23.192.0.0/11", "104.64.0.0/10", "184.24.0.0/13"]
 ip_cache = {}
@@ -87,70 +82,66 @@ async def get_server_name_advanced(headers: dict, url: str) -> str:
     
     return "Unknown"
 
-# --- CORE URL ANALYSIS LOGIC (with new resilient error handling) ---
+# --- Core URL Analysis Logic ---
 async def check_url_status(client: httpx.AsyncClient, url: str):
     start_time = time.time()
     redirect_chain = []
     current_url = url
+    error_message = None
     MAX_REDIRECTS = 15
 
     try:
         for _ in range(MAX_REDIRECTS):
-            response = await client.get(current_url, follow_redirects=False, timeout=60.0)
-            server_name = await get_server_name_advanced(response.headers, str(response.url))
-            
-            hop_info = {
-                "url": str(response.url), 
-                "status": response.status_code, 
-                "server": server_name,
-                "timestamp": time.time() - start_time
-            }
-            redirect_chain.append(hop_info)
-
-            if response.is_redirect:
-                target_url = response.headers.get('location')
-                if not target_url:
-                    raise Exception("Redirect missing location header")
+            try:
+                response = await client.get(current_url, follow_redirects=False, timeout=30.0)
+                server_name = await get_server_name_advanced(response.headers, str(response.url))
                 
-                next_url = urljoin(str(response.url), target_url)
-                if next_url == current_url:
-                    raise Exception("URL redirects to itself in a loop")
-                current_url = next_url
-            else:
-                response.raise_for_status() # Raise exception for 4xx/5xx errors
-                break # Success, end of the chain
-        
-        if len(redirect_chain) >= MAX_REDIRECTS:
-            raise Exception("Too many redirects")
+                hop_info = {
+                    "url": str(response.url), 
+                    "status": response.status_code, 
+                    "server": server_name,
+                    "timestamp": time.time() - start_time
+                }
+                redirect_chain.append(hop_info)
 
-        # If the loop completes successfully
-        return {
-            "originalURL": url,
-            "finalURL": redirect_chain[-1]['url'],
-            "redirectChain": redirect_chain,
-            "totalTime": time.time() - start_time
-        }
+                if response.is_redirect:
+                    target_url = response.headers.get('location')
+                    if not target_url:
+                        raise Exception("Redirect missing location header")
+
+                    next_url = urljoin(str(response.url), target_url)
+
+                    # --- NEW: Check for immediate self-redirect loop ---
+                    if next_url == current_url:
+                        raise Exception("URL redirects to itself in a loop")
+                    
+                    current_url = next_url
+                else:
+                    response.raise_for_status()
+                    break 
+            
+            except httpx.HTTPStatusError as e:
+                break
+
+        if len(redirect_chain) >= MAX_REDIRECTS:
+             error_message = "Too many redirects"
 
     except Exception as e:
-        # This single block now catches ALL possible errors during the check
-        error_message = "An unexpected error occurred"
-        if isinstance(e, httpx.TimeoutException):
-            error_message = "Request timed out after 60s"
-        elif isinstance(e, httpx.HTTPStatusError):
-            error_message = f"HTTP Error: {e.response.status_code}"
-        elif isinstance(e, httpx.RequestError):
-            error_message = "Request failed (Network/DNS error)"
+        if isinstance(e, httpx.RequestError):
+            error_message = "Request failed (e.g., DNS or network error)"
         else:
             error_message = str(e)
-        
-        return {
-            "originalURL": url,
-            "finalURL": current_url if current_url != url else None,
-            "redirectChain": redirect_chain, # Return any partial chain we found
-            "totalTime": time.time() - start_time,
-            "error": error_message
-        }
 
+    final_result = {
+        "originalURL": url,
+        "finalURL": redirect_chain[-1]['url'] if redirect_chain else url,
+        "redirectChain": redirect_chain,
+        "totalTime": time.time() - start_time,
+    }
+    if error_message:
+        final_result["error"] = error_message
+
+    return final_result
 
 @app.websocket("/analyze")
 async def websocket_endpoint(websocket: WebSocket):
@@ -166,7 +157,7 @@ async def websocket_endpoint(websocket: WebSocket):
             async with semaphore:
                 return await check_url_status(client, url)
 
-        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False, headers=BROWSER_HEADERS) as client:
+        async with httpx.AsyncClient(http2=True, limits=httpx.Limits(max_connections=200), verify=False) as client:
             tasks = []
             for url_str in urls:
                 url = url_str.strip()

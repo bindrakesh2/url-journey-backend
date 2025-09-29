@@ -190,7 +190,7 @@ async def validate_url(url: str) -> str:
 async def analyze_urls_websocket(websocket: WebSocket):
     await websocket.accept()
     browser = websocket.app.state.browser
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(1)
 
     async def limited_fetch(url):
         async with semaphore:
@@ -233,4 +233,5 @@ async def test():
     return {"status": "OK", "message": "Service operational"}
 
 # This file should be run with the `uvicorn` command
+
 
